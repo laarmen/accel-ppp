@@ -6,8 +6,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
-#include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 
 #include "triton.h"
@@ -24,7 +24,7 @@ struct tcp_client_t {
 	struct cli_client_t cli_client;
 	struct list_head entry;
 	struct triton_md_handler_t hnd;
-	struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 	struct list_head xmit_queue;
 	struct buffer_t *xmit_buf;
 	uint8_t *cmdline;
@@ -47,6 +47,8 @@ static struct triton_md_handler_t serv_hnd;
 static LIST_HEAD(clients);
 
 static uint8_t *temp_buf;
+
+static __thread char hostname[NI_MAXHOST];
 
 static void disconnect(struct tcp_client_t *cln)
 {
@@ -174,8 +176,10 @@ static int cln_read(struct triton_md_handler_t *h)
 					goto disconn_hard;
 				cln->auth = 1;
 			} else {
-				if (conf_verbose == 2)
-					log_info2("cli: %s: %s\n", inet_ntoa(cln->addr.sin_addr), cln->cmdline);
+				if (conf_verbose == 2) {
+					getnameinfo((struct sockaddr *)&cln->addr, sizeof(cln->addr), hostname, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+					log_info2("cli: %s: %s\n", hostname, cln->cmdline);
+				}	
 
 				cli_process_cmd(&cln->cli_client);
 			}
@@ -248,7 +252,7 @@ disconn:
 
 static int serv_read(struct triton_md_handler_t *h)
 {
-  struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 	socklen_t size = sizeof(addr);
 	int sock;
 	struct tcp_client_t *conn;
@@ -262,8 +266,10 @@ static int serv_read(struct triton_md_handler_t *h)
 			continue;
 		}
 
-		if (conf_verbose)
-			log_info2("cli: tcp: new connection from %s\n", inet_ntoa(addr.sin_addr));
+		if (conf_verbose) {
+			getnameinfo((struct sockaddr *)&addr, size, hostname, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+			log_info2("cli: tcp: new connection from %s\n", hostname);
+		}
 
 		if (fcntl(sock, F_SETFL, O_NONBLOCK)) {
 			log_error("cli: tcp: failed to set nonblocking mode: %s, closing connection...\n", strerror(errno));
@@ -318,54 +324,52 @@ static struct triton_md_handler_t serv_hnd = {
 	.read = serv_read,
 };
 
-static void start_server(const char *host, int port)
+static void start_server(const char *host, const char *port)
 {
-  struct sockaddr_in addr;
+	struct addrinfo *res = NULL;
+	int rv;
+	rv = getaddrinfo(host, port, NULL, &res);
+	if (rv) {
+		log_emerg("cli: tcp: failed to resolve address:port combinartion: %s\n", strerror(errno));
+		return;
+	}
 
-	serv_hnd.fd = socket(PF_INET, SOCK_STREAM, 0);
-  if (serv_hnd.fd < 0) {
-    log_emerg("cli: tcp: failed to create server socket: %s\n", strerror(errno));
-    return;
-  }
+	/* Initial implementation: only connect on the first addrinfo result. */
+	serv_hnd.fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	if (serv_hnd.fd < 0) {
+		log_emerg("cli: tcp: failed to create server socket: %s\n", strerror(errno));
+		goto cleanup;
+	}
 
 	fcntl(serv_hnd.fd, F_SETFD, fcntl(serv_hnd.fd, F_GETFD) | FD_CLOEXEC);
 
-	memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-	if (host)
-		addr.sin_addr.s_addr = inet_addr(host);
-	else
-		addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-  setsockopt(serv_hnd.fd, SOL_SOCKET, SO_REUSEADDR, &serv_hnd.fd, 4);
-  if (bind (serv_hnd.fd, (struct sockaddr *) &addr, sizeof (addr)) < 0) {
-    log_emerg("cli: tcp: failed to bind socket: %s\n", strerror(errno));
+	setsockopt(serv_hnd.fd, SOL_SOCKET, SO_REUSEADDR, &serv_hnd.fd, 4);
+	if (bind (serv_hnd.fd, res->ai_addr, res->ai_addrlen) < 0) {
+		log_emerg("cli: tcp: failed to bind socket: %s\n", strerror(errno));
 		close(serv_hnd.fd);
-    return;
+		goto cleanup;
 	}
 
-  if (listen (serv_hnd.fd, 1) < 0) {
-    log_emerg("cli: tcp: failed to listen socket: %s\n", strerror(errno));
+	if (listen (serv_hnd.fd, 1) < 0) {
+		log_emerg("cli: tcp: failed to listen socket: %s\n", strerror(errno));
 		close(serv_hnd.fd);
-    return;
-  }
+		goto cleanup;
+	}
 
 	if (fcntl(serv_hnd.fd, F_SETFL, O_NONBLOCK)) {
-    log_emerg("cli: tcp: failed to set nonblocking mode: %s\n", strerror(errno));
+		log_emerg("cli: tcp: failed to set nonblocking mode: %s\n", strerror(errno));
 		close(serv_hnd.fd);
-    return;
+		goto cleanup;
 	}
-
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = inet_addr(host);
 
 	triton_context_register(&serv_ctx, NULL);
 	triton_context_set_priority(&serv_ctx, 0);
 	triton_md_register_handler(&serv_ctx, &serv_hnd);
 	triton_md_enable_handler(&serv_hnd, MD_MODE_READ);
 	triton_context_wakeup(&serv_ctx);
+
+cleanup:
+	freeaddrinfo(res);
 }
 
 static void load_config(void)
@@ -382,22 +386,19 @@ static void load_config(void)
 static void init(void)
 {
 	const char *opt;
-	char *host, *d;
-	int port;
+	char *host, *port;
 
 	opt = conf_get_opt("cli", "tcp");
 	if (!opt)
 		return;
 
 	host = strdup(opt);
-	d = strstr(host, ":");
-	if (!d)
+	port = strrchr(host, ':');
+	if (!port)
 		goto err_fmt;
 
-	*d = 0;
-	port = atoi(d + 1);
-	if (port <= 0)
-		goto err_fmt;
+	*port = '\0';
+	port++;
 
 	load_config();
 
